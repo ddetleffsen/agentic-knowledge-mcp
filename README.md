@@ -34,6 +34,39 @@ Add to your coding agent config something along the lines of
 }
 ```
 
+**Run it in Docker instead of npx**
+
+Build the image and point the client at `docker` instead of `npx`. The server talks
+JSON-RPC over stdio, so it needs `docker run -i`. Mount the directory that holds your
+`.knowledge/config.yaml` **read-write** at `/workspace` — that is where docsets are
+downloaded and cached.
+
+```bash
+docker build -t agentic-knowledge-mcp:latest .
+```
+
+```json
+{
+  "mcpServers": {
+    "agentic-knowledge": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "${workspaceFolder}:/workspace",
+        "agentic-knowledge-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+Notes:
+
+- The image bundles Node 22 and the `git` CLI, so `init_docset` can clone Git docsets
+  with no host tooling. It needs outbound network access for clones.
+- The container runs as uid 1000 (`node`); the mounted directory must be writable by
+  that uid (downloaded docsets are written back into your project's `.knowledge/`).
+
 ### 2. Set Up Your First Docset
 
 **Option A: Use the CLI (Recommended)**

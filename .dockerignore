@@ -1,0 +1,49 @@
+# Keep the build context small and reproducible. The Dockerfile only needs the
+# manifests, lockfile, tsconfigs/turbo.json and packages/ sources — everything
+# else here is defense in depth (faster context upload, no stray host artifacts).
+
+# Dependencies & build output (reinstalled / rebuilt inside the image)
+node_modules
+packages/*/node_modules
+packages/*/dist
+**/*.tsbuildinfo
+.turbo
+packages/*/.turbo
+
+# Tests, coverage, docs — not needed to build the server
+**/__tests__
+test
+coverage
+docs
+examples
+
+# Local runtime state (downloaded docsets / temp clones)
+.tmp
+**/.tmp
+
+# Tooling / agent / VCS config
+.git
+.gitignore
+.github
+.husky
+.beads
+.crowd
+.vibe
+.knowledge
+skill
+
+# Secrets & local config (never bake into an image)
+mcp.json
+.env
+.env.*
+
+# Editor / OS noise
+*.log
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Docker artifacts themselves
+Dockerfile
+.dockerignore

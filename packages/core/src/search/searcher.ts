@@ -14,9 +14,10 @@
  */
 
 import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { createInterface } from "node:readline";
+import { inflateRawSync, inflateSync } from "node:zlib";
 import type { SearchDocsResult, SearchMatch, SearchOptions } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,129 @@ const IGNORED_FILES = new Set([".agentic-metadata.json", ".gitignore"]);
  * pattern incorrectly) and go straight to streaming grep.
  */
 const REGEX_META = /[.+*?^${}()|[\]\\]/;
+
+// ---------------------------------------------------------------------------
+// Binary-payload stripping (keeps diagram text searchable, drops base64 blobs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Matches `data:<mime>;base64,<payload>` URIs (e.g. embedded PNGs in `.gliffy`
+ * / `.excalidraw` JSON). Only the payload is replaced; the `data:…;base64,`
+ * prefix is preserved so the surrounding text/structure stays intact.
+ */
+const DATA_URI = /(data:[^,;\s]*;base64,)[A-Za-z0-9+/=]+/g;
+
+/**
+ * Matches long, free-standing base64 runs (e.g. deflate-compressed `<diagram>`
+ * bodies in `.drawio`). The 500-char threshold is conservative — that many
+ * uninterrupted base64 characters effectively never occur in real prose/code.
+ */
+const RAW_B64 = /[A-Za-z0-9+/]{500,}={0,2}/g;
+
+/** 8-byte PNG file signature. */
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * Remove binary payloads (base64 blobs) from a string while preserving all
+ * surrounding text and line structure. Safe to run on a single line or a whole
+ * file blob — the regexes are global. Line numbers are unaffected because no
+ * line is ever added or removed, only shortened in place.
+ */
+export function stripBinary(text: string): string {
+  return text
+    .replace(DATA_URI, "$1…[omitted]")
+    .replace(RAW_B64, "[base64 omitted]");
+}
+
+/**
+ * Extract the diagram XML embedded in a `.drawio.png` file.
+ *
+ * A drawio PNG is a valid PNG whose diagram XML lives in a `tEXt`/`zTXt` chunk
+ * (keyword `mxfile` / `mxGraphModel`) that appears *before* the pixel data
+ * (`IDAT`). We only scan chunk headers and stop at the first `IDAT`/`IEND`, so
+ * the actual image pixels are never decoded.
+ *
+ * @returns the (best-effort decompressed) diagram XML, or `null` when the file
+ *          is not a PNG or carries no drawio chunk (a plain screenshot).
+ */
+export async function extractDrawioXml(
+  absPath: string,
+): Promise<string | null> {
+  let buf: Buffer;
+  try {
+    buf = await readFile(absPath);
+  } catch {
+    return null;
+  }
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIG)) return null;
+
+  let off = 8;
+  while (off + 8 <= buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.toString("ascii", off + 4, off + 8);
+
+    // Pixel data reached → no drawio chunk present.
+    if (type === "IDAT" || type === "IEND") break;
+
+    const dataStart = off + 8;
+    const dataEnd = dataStart + len;
+    if (dataEnd > buf.length) break; // truncated / corrupt chunk
+
+    if (type === "tEXt" || type === "zTXt") {
+      const data = buf.subarray(dataStart, dataEnd);
+      const sep = data.indexOf(0);
+      if (sep !== -1) {
+        const keyword = data.toString("latin1", 0, sep);
+        if (keyword === "mxfile" || keyword === "mxGraphModel") {
+          try {
+            // zTXt: keyword \0 <compression-method-byte> <zlib data>
+            // tEXt: keyword \0 <text>
+            let payload =
+              type === "zTXt"
+                ? inflateSync(data.subarray(sep + 2)).toString("latin1")
+                : data.toString("latin1", sep + 1);
+            // drawio URL-encodes the stored XML.
+            try {
+              payload = decodeURIComponent(payload);
+            } catch {
+              /* not URL-encoded — use the raw payload */
+            }
+            return inflateDrawioDiagrams(payload);
+          } catch {
+            return null; // malformed chunk — treat as plain image
+          }
+        }
+      }
+    }
+
+    off = dataEnd + 4; // 4-byte CRC follows the chunk data
+  }
+  return null;
+}
+
+/**
+ * Replace compressed `<diagram>…</diagram>` bodies (base64 of raw-deflated,
+ * URL-encoded XML) with their decompressed XML so shape labels become
+ * searchable. Uncompressed diagrams (body already starts with `<`) don't match
+ * the base64-only body pattern and are left untouched.
+ */
+function inflateDrawioDiagrams(xml: string): string {
+  return xml.replace(
+    /(<diagram\b[^>]*>)([A-Za-z0-9+/=\s]+?)(<\/diagram>)/g,
+    (match, open: string, body: string, close: string) => {
+      const b64 = body.replace(/\s+/g, "");
+      if (b64.length === 0) return match;
+      try {
+        const inflated = inflateRawSync(Buffer.from(b64, "base64")).toString(
+          "latin1",
+        );
+        return `${open}${decodeURIComponent(inflated)}${close}`;
+      } catch {
+        return match; // not compressed / decode failed → leave as-is
+      }
+    },
+  );
+}
 
 // ---------------------------------------------------------------------------
 // MiniSearch integration (optional, best-effort)
@@ -325,27 +449,38 @@ async function grepFile(
 ): Promise<SearchMatch[]> {
   if (limit <= 0) return [];
 
-  // Binary detection: read first 8 KB and check for null bytes
-  if (await isBinaryFile(absPath)) return [];
-
   const lines: string[] = [];
-  const matchIndices: number[] = []; // 0-based indices into `lines`
 
-  try {
-    const rl = createInterface({
-      input: createReadStream(absPath, { encoding: "utf8" }),
-      crlfDelay: Infinity,
-    });
+  if (/\.png$/i.test(absPath)) {
+    // .drawio.png → search the embedded diagram XML; plain screenshots → skip.
+    // Line numbers below are synthetic (relative to the extracted XML).
+    const xml = await extractDrawioXml(absPath);
+    if (xml === null) return [];
+    for (const line of xml.split(/\r?\n/)) lines.push(stripBinary(line));
+  } else {
+    // Binary detection: read first 8 KB and check for null bytes
+    if (await isBinaryFile(absPath)) return [];
 
-    for await (const line of rl) {
-      lines.push(line);
-      if (regex.test(line)) {
-        matchIndices.push(lines.length - 1);
+    try {
+      const rl = createInterface({
+        input: createReadStream(absPath, { encoding: "utf8" }),
+        crlfDelay: Infinity,
+      });
+
+      for await (const line of rl) {
+        // Strip embedded base64 payloads so megabyte blobs never reach the
+        // response (the root cause of `Transport closed`). Text is preserved.
+        lines.push(stripBinary(line));
       }
+    } catch {
+      // Unreadable file (permissions, encoding errors) — skip silently
+      return [];
     }
-  } catch {
-    // Unreadable file (permissions, encoding errors) — skip silently
-    return [];
+  }
+
+  const matchIndices: number[] = []; // 0-based indices into `lines`
+  for (let i = 0; i < lines.length; i++) {
+    if (regex.test(lines[i]!)) matchIndices.push(i);
   }
 
   const results: SearchMatch[] = [];
@@ -378,10 +513,14 @@ async function grepFile(
 
 /** Read a file as UTF-8 text; returns null for binary or unreadable files. */
 async function readTextFile(absPath: string): Promise<string | null> {
+  if (/\.png$/i.test(absPath)) {
+    // .drawio.png → index the embedded diagram XML; plain screenshots → skip.
+    const xml = await extractDrawioXml(absPath);
+    return xml === null ? null : stripBinary(xml);
+  }
   if (await isBinaryFile(absPath)) return null;
   try {
-    const { readFile } = await import("node:fs/promises");
-    return await readFile(absPath, "utf8");
+    return stripBinary(await readFile(absPath, "utf8"));
   } catch {
     return null;
   }

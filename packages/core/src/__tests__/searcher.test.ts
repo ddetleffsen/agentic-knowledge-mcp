@@ -6,10 +6,13 @@ import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { deflateRawSync } from "node:zlib";
 import {
   searchDocset,
   buildFileIndex,
   formatSearchResult,
+  stripBinary,
+  extractDrawioXml,
 } from "../search/searcher.js";
 
 // ---------------------------------------------------------------------------
@@ -316,5 +319,173 @@ describe("formatSearchResult", () => {
     const text = formatSearchResult(result);
     expect(text).toContain("OAuth2");
     expect(text).toMatch(/\d+ match/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripBinary — base64 payload removal
+// ---------------------------------------------------------------------------
+
+describe("stripBinary", () => {
+  test("removes data-URI base64 payload but keeps the prefix and text", () => {
+    const huge = "A".repeat(100_000);
+    const line = `{"label":"Box A","dataURL":"data:image/png;base64,${huge}"}`;
+    const out = stripBinary(line);
+    expect(out).not.toContain(huge);
+    expect(out).toContain("data:image/png;base64,…[omitted]");
+    expect(out).toContain('"label":"Box A"');
+    expect(out.length).toBeLessThan(200);
+  });
+
+  test("removes long free-standing base64 runs", () => {
+    const blob = "Zm9vYmFy".repeat(200); // > 500 chars, pure base64
+    const out = stripBinary(`<diagram>${blob}</diagram>`);
+    expect(out).toBe("<diagram>[base64 omitted]</diagram>");
+  });
+
+  test("leaves ordinary text untouched", () => {
+    const text = "The quick brown fox jumps over the lazy dog.";
+    expect(stripBinary(text)).toBe(text);
+  });
+
+  test("preserves line count when run on a multi-line blob", () => {
+    const blob = "ABCD".repeat(200);
+    const input = `line1\ndata:image/png;base64,${blob}\nline3`;
+    expect(stripBinary(input).split("\n")).toHaveLength(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractDrawioXml + .drawio.png search integration
+// ---------------------------------------------------------------------------
+
+/** Build a minimal PNG carrying a `tEXt`/`mxfile` chunk (CRC is not validated). */
+function buildDrawioPng(mxfileXml: string, keyword = "mxfile"): Buffer {
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    return Buffer.concat([
+      len,
+      Buffer.from(type, "ascii"),
+      data,
+      Buffer.alloc(4), // dummy CRC — extractDrawioXml does not verify it
+    ]);
+  };
+  const textData = Buffer.concat([
+    Buffer.from(`${keyword}\0`, "latin1"),
+    Buffer.from(mxfileXml, "latin1"),
+  ]);
+  // tEXt chunk must precede IDAT; add a fake IDAT to prove we stop before pixels.
+  return Buffer.concat([
+    PNG_SIG,
+    chunk("tEXt", textData),
+    chunk("IDAT", Buffer.from("PIXELDATA_NOT_SEARCHABLE")),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+/** drawio's compressed diagram body: raw-deflate( urlencode(innerXml) ) → base64. */
+function compressDiagram(innerXml: string): string {
+  const encoded = encodeURIComponent(innerXml);
+  return deflateRawSync(Buffer.from(encoded, "latin1")).toString("base64");
+}
+
+describe("extractDrawioXml", () => {
+  let dir: string;
+
+  beforeAll(async () => {
+    dir = join(tmpdir(), `drawio-test-${Date.now()}`);
+    await mkdir(dir, { recursive: true });
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("returns null for a non-PNG file", async () => {
+    const p = join(dir, "notpng.png");
+    await writeFile(p, "this is plain text, not a png");
+    expect(await extractDrawioXml(p)).toBeNull();
+  });
+
+  test("extracts uncompressed diagram XML from a tEXt chunk", async () => {
+    const xml = "<mxfile><diagram>Plain Label Here</diagram></mxfile>";
+    const p = join(dir, "plain.drawio.png");
+    await writeFile(p, buildDrawioPng(xml));
+    const out = await extractDrawioXml(p);
+    expect(out).toContain("Plain Label Here");
+    expect(out).not.toContain("PIXELDATA_NOT_SEARCHABLE");
+  });
+
+  test("inflates a compressed diagram body so labels become readable", async () => {
+    const inner =
+      '<mxGraphModel><root><mxCell value="SearchableShapeLabel"/></root></mxGraphModel>';
+    const xml = `<mxfile><diagram id="x" name="Page-1">${compressDiagram(inner)}</diagram></mxfile>`;
+    const p = join(dir, "compressed.drawio.png");
+    await writeFile(p, buildDrawioPng(xml));
+    const out = await extractDrawioXml(p);
+    expect(out).toContain("SearchableShapeLabel");
+  });
+});
+
+describe("searchDocset – diagram content", () => {
+  let dir: string;
+
+  beforeAll(async () => {
+    dir = join(tmpdir(), `diagram-search-test-${Date.now()}`);
+    await mkdir(dir, { recursive: true });
+
+    // 1. excalidraw-like JSON: searchable label next to a multi-MB base64 image.
+    const huge = "iVBORw0KGgo".repeat(200_000); // ~2 MB single-line payload
+    await writeFile(
+      join(dir, "diagram.excalidraw"),
+      `{"type":"excalidraw","elements":[{"type":"text","text":"DeploymentView"}],` +
+        `"files":{"img1":{"dataURL":"data:image/png;base64,${huge}"}}}`,
+    );
+
+    // 2. compressed .drawio.png with a searchable shape label.
+    const inner =
+      '<mxGraphModel><root><mxCell value="ResilienceGateway"/></root></mxGraphModel>';
+    const xml = `<mxfile><diagram name="P1">${compressDiagram(inner)}</diagram></mxfile>`;
+    await writeFile(join(dir, "arch.drawio.png"), buildDrawioPng(xml));
+
+    // 3. a plain screenshot PNG (no mxfile chunk) → must be skipped cleanly.
+    const PNG_SIG = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    await writeFile(
+      join(dir, "screenshot.png"),
+      Buffer.concat([PNG_SIG, Buffer.from([0x00, 0x01, 0x02, 0x03])]),
+    );
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("finds the text label inside an excalidraw file", async () => {
+    const result = await searchDocset(dir, "DeploymentView");
+    expect(result.total_matches).toBeGreaterThan(0);
+  });
+
+  test("does not leak the base64 payload into results (no Transport-blow-up)", async () => {
+    const result = await searchDocset(dir, "DeploymentView");
+    const text = formatSearchResult(result);
+    expect(text).not.toContain("iVBORw0KGgo");
+    expect(text.length).toBeLessThan(5_000);
+  });
+
+  test("makes a compressed .drawio.png shape label searchable", async () => {
+    const result = await searchDocset(dir, "ResilienceGateway");
+    expect(result.total_matches).toBeGreaterThan(0);
+    expect(result.matches.some((m) => m.file.endsWith(".drawio.png"))).toBe(
+      true,
+    );
+  });
+
+  test("plain screenshot PNG yields no matches and no error", async () => {
+    const result = await searchDocset(dir, "ResilienceGateway|anything");
+    expect(result.matches.every((m) => m.file !== "screenshot.png")).toBe(true);
   });
 });
